@@ -316,6 +316,7 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 				if(ray.Address == Address_Null)
 					ray = Ray_t();
 				
+				// Check in all directions (including above the player)
 				for(i = 0; i < 3; i++)
 				{
 					for(j = 0; j < 3; j++)
@@ -383,6 +384,39 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 						}
 					}
 				}
+				
+				// Also do specific check above the player to catch ceiling issues
+				// This adds a check specifically for the case where player's head hits a ceiling
+				PROF_START();
+				float upOffset[3];
+				upOffset[0] = 0.0;
+				upOffset[1] = 0.0;
+				upOffset[2] = gRampInitialRetraceLength.FloatValue * 2.0;
+				AddVectors(fixed_origin, upOffset, buff);
+
+				
+				if(gEngineVersion == Engine_CSGO)
+				{
+					SubtractVectors(VectorToArray(GetPlayerMins(pThis)), offset_mins, offset_mins); 
+					AddVectors(VectorToArray(GetPlayerMaxs(pThis)), offset_maxs, offset_maxs);
+				}
+				else
+				{
+					SubtractVectors(VectorToArray(GetPlayerMinsCSS(pThis, alloced_vector)), offset_mins, offset_mins); 
+					AddVectors(VectorToArray(GetPlayerMaxsCSS(pThis, alloced_vector2)), offset_maxs, offset_maxs);
+				}
+				
+				ray.Init(buff, buff, offset_mins, offset_maxs);
+				UTIL_TraceRay(ray, MASK_PLAYERSOLID, pThis, COLLISION_GROUP_PLAYER_MOVEMENT, pm);
+				
+				plane_normal = pm.plane.normal;
+				if(FloatAbs(plane_normal.x) <= 1.0 && FloatAbs(plane_normal.y) <= 1.0 &&
+					FloatAbs(plane_normal.z) <= 1.0 && !pm.startsolid && pm.fraction < 1.0)
+				{
+					valid_planes++;
+					AddVectors(valid_plane, VectorToArray(plane_normal), valid_plane);
+				}
+				PROF_STOP(5);
 				
 				if(valid_planes != 0 && !CloseEnough(valid_plane, view_as<float>({0.0, 0.0, 0.0})))
 				{
