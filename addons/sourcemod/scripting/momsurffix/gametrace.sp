@@ -132,6 +132,7 @@ methodmap CGameTrace < AllocatableBase
 	property float fraction
 	{
 		public get() { return view_as<float>(LoadFromAddress(this.Address + offsets.cgtoffsets.fraction, NumberType_Int32)); }
+		public set(float value) { StoreToAddress(this.Address + offsets.cgtoffsets.fraction, view_as<int>(value), NumberType_Int32); }
 	}
 	
 	property int contents
@@ -187,6 +188,14 @@ methodmap CGameTrace < AllocatableBase
 	public CGameTrace()
 	{
 		return MALLOC(CGameTrace);
+	}
+
+	public void CopyTo(CGameTrace destination)
+	{
+		ASSERT(destination.Address != Address_Null);
+
+		for(int i = 0; i < CGameTrace.Size(); i++)
+			StoreToAddress(destination.Address + i, LoadFromAddress(this.Address + i, NumberType_Int8), NumberType_Int8);
 	}
 }
 
@@ -477,4 +486,4 @@ stock void TraceRayAgainstLeafAndEntityList(Ray_t ray, ITraceListData traceData,
 stock void TraceRay(Ray_t ray, int mask, CTraceFilterSimple filter, CGameTrace trace)
 {
 	SDKCall(gTraceRay, gEngineTrace, ray.Address, mask, filter.Address, trace.Address);
-}
+}
