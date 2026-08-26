@@ -1,3 +1,20 @@
+// Surf Stuck Fix
+//
+// Replaces CGameMovement::TryPlayerMove with Momentum Mod's version, which
+// recovers from the ramp collision bugs vanilla movement can't: instead of
+// zeroing velocity when a move trace starts inside a surface, it hunts for
+// the plane the player is actually pressed against and clips velocity along
+// it, so surfers slide on instead of stopping dead.
+//
+// On top of the Momentum port, this fork adds an embedded-hull rescue: when
+// the hull is *fully* inside solid (headsurf wedges, enclosed pockets that
+// pin feet and head at once) no plane is findable in any direction, so the
+// plugin searches the nearby space for the closest spot the hull fits and
+// resumes the move from there with velocity intact.
+//
+// File/gamedata/cvar names keep the momsurffix2 prefix for compatibility
+// with existing server configs.
+
 #include "sourcemod"
 #include "sdktools"
 #include "sdkhooks"
@@ -5,19 +22,22 @@
 
 #define SNAME "[momsurffix2] "
 #define GAME_DATA_FILE "momsurffix2.games"
-// #define DEBUG_PROFILE
 // #define DEBUG_MEMTEST
 
 public Plugin myinfo = {
-    name = "Momentum surf fix \'2",
-    author = "GAMMA CASE",
-    description = "Ported surf fix from momentum mod.",
-    version = "1.1.5",
-    url = "http://steamcommunity.com/id/_GAMMACASE_/"
+    name = "Surf Stuck Fix",
+    author = "GAMMA CASE, lodyb",
+    description = "Fixes ramp collision bugs and unsticks embedded players.",
+    version = "1.3.0",
+    url = "https://github.com/lodyb/MomSurfFix"
 };
 
 #define FLT_EPSILON 1.192092896e-07
 #define MAX_CLIP_PLANES 5
+// seam-pierce tier (ported from SurfSam's CS2-gist adaptation)
+#define RAMP_PIERCE_DISTANCE 0.0625
+#define RAMP_BUG_THRESHOLD 0.98
+#define NEW_RAMP_THRESHOLD 0.95
 
 enum OSType
 {
@@ -44,49 +64,32 @@ EngineVersion gEngineVersion;
 ConVar gRampBumpCount,
 	gBounce,
 	gRampInitialRetraceLength,
-	gNoclipWorkAround;
+	gNoclipWorkAround,
+	gRescue,
+	gPierce,
+	gSweepFast;
+
+// last plane each player validly collided with; keyed by ehandle so a
+// reconnect in the same slot resets it
+float gLastPlane[MAXPLAYERS + 1][3];
+int gLastPlaneHandle[MAXPLAYERS + 1];
 
 float vec3_origin[3] = {0.0, 0.0, 0.0};
 bool gBasePlayerLoadedTooEarly;
 
-#if defined DEBUG_PROFILE
-#include "profiler"
-Profiler gProf;
-ArrayList gProfData;
-float gProfTime;
-
-void PROF_START()
-{
-	if(gProf)
-		gProf.Start();
-}
-
-void PROF_STOP(int idx)
-{
-	if(gProf)
-	{
-		gProf.Stop();
-		Prof_Check(idx);
-	}
-}
-
-#else
-#define PROF_START%1;
-#define PROF_STOP%1;
-#endif
 
 public void OnPluginStart()
 {
 #if defined DEBUG_MEMTEST
 	RegAdminCmd("sm_mom_dumpmempool", SM_Dumpmempool, ADMFLAG_ROOT, "Dumps active momory pool. Mainly for debugging.");
 #endif
-#if defined DEBUG_PROFILE
-	RegAdminCmd("sm_mom_prof", SM_Prof, ADMFLAG_ROOT, "Profiles performance of some expensive parts. Mainly for debugging.");
-#endif
 	
 	gRampBumpCount = CreateConVar("momsurffix_ramp_bumpcount", "8", "Helps with fixing surf/ramp bugs", .hasMin = true, .min = 4.0, .hasMax = true, .max = 16.0);
 	gRampInitialRetraceLength = CreateConVar("momsurffix_ramp_initial_retrace_length", "0.2", "Amount of units used in offset for retraces", .hasMin = true, .min = 0.2, .hasMax = true, .max = 5.0);
 	gNoclipWorkAround = CreateConVar("momsurffix_enable_noclip_workaround", "1", "Enables workaround to prevent issue #1, can actually help if momsuffix_enable_asm_optimizations is 0", .hasMin = true, .min = 0.0, .hasMax = true, .max = 1.0);
+	gPierce = CreateConVar("momsurffix_pierce", "1", "Enable the seam-pierce tier: dodge phantom/deviant collision planes on ramp seams", .hasMin = true, .min = 0.0, .hasMax = true, .max = 1.0);
+	gSweepFast = CreateConVar("momsurffix_sweep_fast", "1", "Replace the legacy 27-trace stuck sweep with a directional probe (0 = legacy momentum-mod sweep)", .hasMin = true, .min = 0.0, .hasMax = true, .max = 1.0);
+	gRescue = CreateConVar("momsurffix_rescue", "1", "Enable the embedded-hull rescue; 0 reproduces stock 1.1.5 stuck behaviour", .hasMin = true, .min = 0.0, .hasMax = true, .max = 1.0);
 	gBounce = FindConVar("sv_bounce");
 	ASSERT_MSG(gBounce, "\"sv_bounce\" convar wasn't found!");
 	
@@ -132,67 +135,6 @@ public Action SM_Dumpmempool(int client, int args)
 }
 #endif
 
-#if defined DEBUG_PROFILE
-public Action SM_Prof(int client, int args)
-{
-	if(args < 1)
-	{
-		ReplyToCommand(client, SNAME..."Usage: sm_prof <seconds>");
-		return Plugin_Handled;
-	}
-	
-	char buff[32];
-	GetCmdArg(1, buff, sizeof(buff));
-	gProfTime = StringToFloat(buff);
-	
-	if(gProfTime <= 0.1)
-	{
-		ReplyToCommand(client, SNAME..."Time should be higher then 0.1 seconds.");
-		return Plugin_Handled;
-	}
-	
-	gProfData = new ArrayList(3);
-	gProf = new Profiler();
-	CreateTimer(gProfTime, Prof_Check_Timer, client);
-	
-	ReplyToCommand(client, SNAME..."Profiler started, awaiting %.2f seconds.", gProfTime);
-	
-	return Plugin_Handled;
-}
-
-stock void Prof_Check(int idx)
-{
-	int idx2;
-	if(gProfData.Length - 1 < idx)
-	{
-		idx2 = gProfData.Push(gProf.Time);
-		gProfData.Set(idx2, 1, 1);
-		gProfData.Set(idx2, idx, 2);
-	}
-	else
-	{
-		idx2 = gProfData.FindValue(idx, 2);
-		
-		gProfData.Set(idx2, view_as<float>(gProfData.Get(idx2)) + gProf.Time);
-		gProfData.Set(idx2, gProfData.Get(idx2, 1) + 1, 1);
-	}
-}
-
-public Action Prof_Check_Timer(Handle timer, int client)
-{
-	ReplyToCommand(client, SNAME..."Profiler finished:");
-	if(gProfData.Length == 0)
-		ReplyToCommand(client, SNAME..."There was no profiling data...");
-	
-	for(int i = 0; i < gProfData.Length; i++)
-		ReplyToCommand(client, SNAME..."[%i] Avg time: %f | Calls: %i", i, view_as<float>(gProfData.Get(i)) / float(gProfData.Get(i, 1)), gProfData.Get(i, 1));
-	
-	delete gProf;
-	delete gProfData;
-	
-	return Plugin_Handled;
-}
-#endif
 
 void ValidateGameAndOS(GameData gd)
 {
@@ -232,7 +174,7 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 	float original_velocity[3], primal_velocity[3], fixed_origin[3], valid_plane[3], new_velocity[3], end[3], dir[3];
 	float allFraction, d, time_left = GetGameFrameTime(), planes[MAX_CLIP_PLANES][3];
 	int bumpcount, blocked, numplanes, numbumps = gRampBumpCount.IntValue, i, j, h;
-	bool stuck_on_ramp, has_valid_plane;
+	bool stuck_on_ramp, has_valid_plane, embedded, rescue_tried;
 	CGameTrace pm = CGameTrace();
 	
 	Vector vecVelocity = pThis.mv.m_vecVelocity;
@@ -250,11 +192,27 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 	if(alloced_vector2.Address == Address_Null)
 		alloced_vector2 = Vector();
 	
+	CBaseHandle hPlayer = pThis.mv.m_nPlayerHandle;
+	int hidx = hPlayer.m_Index;
+	int client = (hidx == INVALID_EHANDLE_INDEX) ? -1 : (hidx & ENT_ENTRY_MASK);
+	bool track = client >= 1 && client <= MAXPLAYERS;
+	if(track && gLastPlaneHandle[client] != hidx)
+	{
+		VectorCopy(vec3_origin, gLastPlane[client]);
+		gLastPlaneHandle[client] = hidx;
+	}
+	bool prev_frac0 = false;
+
+
 	for(bumpcount = 0; bumpcount < numbumps; bumpcount++)
 	{
 		if(vecVelocity.LengthSqr() == 0.0)
 			break;
 		
+		// Stuck path: the previous bump's move trace was unusable (startsolid or
+		// zero fraction). Find a plane to clip against and nudge off of, in
+		// cheapest-first order: the last trace's plane, then the planes already
+		// hit this tick, then a 27-trace sweep, then the embedded rescue.
 		if(stuck_on_ramp)
 		{
 			if(!has_valid_plane)
@@ -284,6 +242,8 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 			
 			if(has_valid_plane)
 			{
+				// Standable plane (z >= 0.7) clips flat; steeper surf planes get
+				// sv_bounce scaled by surface friction, matching engine behaviour.
 				alloced_vector.FromArray(valid_plane);
 				if(valid_plane[2] >= 0.7 && valid_plane[2] <= 1.0)
 				{
@@ -297,10 +257,74 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 				}
 				alloced_vector.ToArray(valid_plane);
 			}
-			//TODO: should be replaced with normal solution!! Currently hack to fix issue #1.
+			// No plane known - probe for one. The vertical-velocity gate is the
+			// upstream workaround for issue #1 (noclip exit jitter): a player
+			// drifting at near-zero vz skips the sweep so they fall through to
+			// vanilla instead of being nudged around.
 			else if(!gNoclipWorkAround.BoolValue || (vecVelocity.z < -6.25 || vecVelocity.z > 0.0))
 			{
-				//Quite heavy part of the code, should not be triggered much or else it'll impact performance by a lot!!!
+				if(gSweepFast.BoolValue)
+				{
+					// Fast probe: session logs showed the legacy 27-trace sweep
+					// succeeding ~once in 200 runs. Instead: zero-length hull-fit
+					// tests classify which sides are open (last-plane dir first,
+					// then the axes), then ONE swept trace from the first open
+					// spot fetches the plane. ~7 point tests + 1 swept trace vs
+					// 27 grown-hull swept traces, per stuck bump.
+					int valid_planes = 0;
+					VectorCopy(view_as<float>({0.0, 0.0, 0.0}), valid_plane);
+
+					float probe = (float(bumpcount) * 2.0) * gRampInitialRetraceLength.FloatValue;
+					if(probe < 0.5)
+						probe = 0.5;
+
+					float pdirs[7][3];
+					int npdirs = 0;
+					if(track && GetVectorLength(gLastPlane[client], true) > FLT_EPSILON)
+					{
+						VectorCopy(gLastPlane[client], pdirs[npdirs]);
+						npdirs++;
+					}
+					pdirs[npdirs][2] = 1.0; npdirs++;
+					pdirs[npdirs][2] = -1.0; npdirs++;
+					pdirs[npdirs][0] = 1.0; npdirs++;
+					pdirs[npdirs][0] = -1.0; npdirs++;
+					pdirs[npdirs][1] = 1.0; npdirs++;
+					pdirs[npdirs][1] = -1.0; npdirs++;
+
+					float ppos[3];
+					for(i = 0; i < npdirs; i++)
+					{
+						VectorMA(fixed_origin, probe, pdirs[i], ppos);
+						alloced_vector.FromArray(ppos);
+						TracePlayerBBox(pThis, alloced_vector, alloced_vector, MASK_PLAYERSOLID, COLLISION_GROUP_PLAYER_MOVEMENT, pm);
+						if(pm.startsolid)
+							continue;
+						// open side found - one swept trace back through the move
+						alloced_vector2.FromArray(end);
+						TracePlayerBBox(pThis, alloced_vector, alloced_vector2, MASK_PLAYERSOLID, COLLISION_GROUP_PLAYER_MOVEMENT, pm);
+						plane_normal = pm.plane.normal;
+						if(FloatAbs(plane_normal.x) <= 1.0 && FloatAbs(plane_normal.y) <= 1.0 &&
+							FloatAbs(plane_normal.z) <= 1.0 && pm.fraction > 0.0 && pm.fraction < 1.0 && !pm.startsolid)
+						{
+							plane_normal.ToArray(valid_plane);
+							valid_planes = 1;
+							break;
+						}
+					}
+
+					if(valid_planes != 0 && !CloseEnough(valid_plane, view_as<float>({0.0, 0.0, 0.0})))
+					{
+						has_valid_plane = true;
+						NormalizeVector(valid_plane, valid_plane);
+						continue;
+					}
+				}
+				else
+				{
+				// Legacy 27-trace sweep: retrace the move from origins offset by
+				// up to +-(bump * 2 * retrace_length) on each axis, with the hull
+				// grown by the offset. Kept behind momsurffix_sweep_fast 0.
 				float offsets[3];
 				offsets[0] = (float(bumpcount) * 2.0) * -gRampInitialRetraceLength.FloatValue;
 				offsets[2] = (float(bumpcount) * 2.0) * gRampInitialRetraceLength.FloatValue;
@@ -322,7 +346,6 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 					{
 						for(h = 0; h < 3; h++)
 						{
-							PROF_START();
 							offset[0] = offsets[i];
 							offset[1] = offsets[j];
 							offset[2] = offsets[h];
@@ -345,9 +368,7 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 								offset_maxs[1] /= 2.0;
 							if(offset[2] < 0.0)
 								offset_maxs[2] /= 2.0;
-							PROF_STOP(0);
 							
-							PROF_START();
 							AddVectors(fixed_origin, offset, buff);
 							SubtractVectors(end, offset, offset);
 							if(gEngineVersion == Engine_CSGO)
@@ -360,26 +381,19 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 								SubtractVectors(VectorToArray(GetPlayerMinsCSS(pThis, alloced_vector)), offset_mins, offset_mins); 
 								AddVectors(VectorToArray(GetPlayerMaxsCSS(pThis, alloced_vector2)), offset_maxs, offset_maxs);
 							}
-							PROF_STOP(1);
 							
-							PROF_START();
 							ray.Init(buff, offset, offset_mins, offset_maxs);
-							PROF_STOP(2);
 							
-							PROF_START();
 							UTIL_TraceRay(ray, MASK_PLAYERSOLID, pThis, COLLISION_GROUP_PLAYER_MOVEMENT, pm);
-							PROF_STOP(3);
 							
-							PROF_START();
 							plane_normal = pm.plane.normal;
-							
+
 							if(FloatAbs(plane_normal.x) <= 1.0 && FloatAbs(plane_normal.y) <= 1.0 &&
 								FloatAbs(plane_normal.z) <= 1.0 && pm.fraction > 0.0 && pm.fraction < 1.0 && !pm.startsolid)
 							{
 								valid_planes++;
 								AddVectors(valid_plane, VectorToArray(plane_normal), valid_plane);
 							}
-							PROF_STOP(4);
 						}
 					}
 				}
@@ -390,7 +404,9 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 					NormalizeVector(valid_plane, valid_plane);
 					continue;
 				}
+				}
 			}
+			else
 			
 			if(has_valid_plane)
 			{
@@ -398,13 +414,35 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 			}
 			else
 			{
+				// Hull is embedded in solid (head, feet or both) - the offset sweep
+				// can't see any free plane from inside a brush. Look for the nearest
+				// spot the hull actually fits and resume the move from there.
+				// Deliberately ignores the noclip vz gate above: a wedged player's
+				// clipped velocity usually sits exactly in that (-6.25, 0] window.
+				// One attempt per call: a failed search from this origin cannot
+				// succeed on a later bump, and retrying would burn ~84 traces
+				// per bump on players wedged beyond the 32u radius.
+				if(embedded && !rescue_tried && gRescue.BoolValue)
+				{
+					rescue_tried = true;
+					if(TryEmbeddedRescue(pThis, fixed_origin, vecVelocity))
+					{
+						vecAbsOrigin.FromArray(fixed_origin);
+						stuck_on_ramp = false;
+						has_valid_plane = false;
+						embedded = false;
+						continue;
+					}
+				}
 				stuck_on_ramp = false;
 				continue;
 			}
 		}
 		
+		// Trace the move for what's left of the tick. Reuse the caller's trace
+		// when the destination matches - the engine already traced that.
 		VectorMA(fixed_origin, time_left, VectorToArray(vecVelocity), end);
-		
+
 		if(pFirstDest.Address != Address_Null && IsEqual(end, VectorToArray(pFirstDest)))
 		{
 			pm.Free();
@@ -426,8 +464,32 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 			}
 		}
 		
-		if(bumpcount > 0 && pThis.player.m_hGroundEntity == view_as<Address>(-1) && !IsValidMovementTrace(pThis, pm))
+		// Seam-pierce tier: a plane whose normal suddenly deviates from the one
+		// we were riding (compiled seam bumps, VBSP bevel cuts), or two
+		// zero-fraction traces in a row, gets dodged by re-tracing the move on
+		// a line offset off the old plane. Runs before the stuck machinery so
+		// phantom planes never feed it.
+		if(gPierce.BoolValue && track && !stuck_on_ramp && !CloseEnough(fixed_origin, end))
 		{
+			bool has_last = GetVectorLength(gLastPlane[client], true) > FLT_EPSILON;
+			if(has_last)
+			{
+				bool normal_changed = GetVectorDotProduct(VectorToArray(pm.plane.normal), gLastPlane[client]) < RAMP_BUG_THRESHOLD;
+				bool last_was_wall = gLastPlane[client][2] < 0.03125;
+				bool double_stuck = prev_frac0 && CloseEnoughFloat(pm.fraction, 0.0);
+				if((normal_changed && !last_was_wall) || double_stuck)
+					TryPierce(pThis, fixed_origin, end, gLastPlane[client], pm);
+			}
+			if(pm.plane.normal.Length() > 0.99)
+				pm.plane.normal.ToArray(gLastPlane[client]);
+			prev_frac0 = CloseEnoughFloat(pm.fraction, 0.0);
+		}
+
+		// allsolid also triggers the stuck path while grounded: enclosed spots can
+		// wedge the head into a brush above while the feet still count as on-ground
+		if(bumpcount > 0 && (pThis.player.m_hGroundEntity == view_as<Address>(-1) || pm.allsolid) && !IsValidMovementTrace(pThis, pm))
+		{
+			embedded = pm.startsolid || pm.allsolid;
 			has_valid_plane = false;
 			stuck_on_ramp = true;
 			continue;
@@ -435,6 +497,9 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 		
 		if(pm.fraction > 0.0)
 		{
+			// A "clean" full-length move can still end with the hull overlapping
+			// solid (precision loss along steep planes). Verify the endpoint
+			// actually fits before accepting it.
 			if((bumpcount == 0 || pThis.player.m_hGroundEntity != view_as<Address>(-1)) && numbumps > 0 && pm.fraction == 1.0)
 			{
 				CGameTrace stuck = CGameTrace();
@@ -444,14 +509,14 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 				{
 					has_valid_plane = false;
 					stuck_on_ramp = true;
-					
+
 					stuck.Free();
 					continue;
 				}
 				else if(stuck.startsolid || stuck.fraction != 1.0)
 				{
 					vecVelocity.FromArray(vec3_origin);
-					
+
 					stuck.Free();
 					break;
 				}
@@ -491,10 +556,12 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 		pm.plane.normal.ToArray(planes[numplanes]);
 		numplanes++;
 		
+		// Standard Source clip-plane resolution from here down: walking against
+		// one plane clips directly; multiple planes try each in turn, then the
+		// two-plane crease slides along the planes' cross product.
 		if(numplanes == 1 && pThis.player.m_MoveType == MOVETYPE_WALK && pThis.player.m_hGroundEntity != view_as<Address>(-1))
 		{
 			Vector vec1 = Vector();
-			PROF_START();
 			if(planes[0][2] >= 0.7)
 			{
 				vec1.FromArray(original_velocity);
@@ -512,7 +579,6 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 				ClipVelocity(pThis, vec1, alloced_vector2, alloced_vector, 1.0 + gBounce.FloatValue * (1.0 - pThis.player.m_surfaceFriction));
 				alloced_vector.ToArray(new_velocity);
 			}
-			PROF_STOP(5);
 			
 			vecVelocity.FromArray(new_velocity);
 			VectorCopy(new_velocity, original_velocity);
@@ -539,7 +605,7 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 			
 			if(i != numplanes)
 			{
-				
+				// found a plane whose clip keeps us off every other plane
 			}
 			else
 			{
@@ -577,7 +643,9 @@ int TryPlayerMove(CGameMovement pThis, Vector pFirstDest, CGameTrace pFirstTrace
 	}
 	
 	if(CloseEnoughFloat(allFraction, 0.0))
+	{
 		vecVelocity.FromArray(vec3_origin);
+	}
 	
 	pm.Free();
 	return blocked;
@@ -639,6 +707,149 @@ public void SetFailStateCustom(const char[] fmt, any ...)
 	SetFailState("[%s | %i] %s", ostype, gEngineVersion, buff);
 }
 
+// Seam-pierce (SurfSam's port of the CS2-gist approach, primary-direction
+// first): re-trace the move on a line offset RAMP_PIERCE_DISTANCE off the
+// last plane the player validly rode. If the offset trace runs clean, keeps
+// riding the same plane, or lands on a coherent new one, adopt it as the
+// movement result - the phantom seam plane is never resolved against.
+// Typical cost 2-3 traces; worst case ~28 when every candidate fails.
+bool TryPierce(CGameMovement pThis, float start[3], float end[3], float lastPlane[3], CGameTrace pm)
+{
+	float errN[3], dir[3], offStart[3], offEnd[3], buff[3];
+	pm.plane.normal.ToArray(errN);
+
+	static Vector vs, ve;
+	static CGameTrace pierce, confirm;
+	if(vs.Address == Address_Null) vs = Vector();
+	if(ve.Address == Address_Null) ve = Vector();
+	if(pierce.Address == Address_Null) pierce = CGameTrace();
+	if(confirm.Address == Address_Null) confirm = CGameTrace();
+
+	float total = GetVectorDistance(start, end);
+	static const float offsets[] = {0.0, -1.0, 1.0};
+
+	// candidate 0 is the last plane's own normal, tried at two depths; the
+	// axis fan (filtered to directions off the plane) is the rare fallback
+	for(int cand = 0; cand < 27; cand++)
+	{
+		int nratios;
+		if(cand == 0)
+		{
+			VectorCopy(lastPlane, dir);
+			nratios = 2;
+		}
+		else
+		{
+			dir[0] = offsets[cand / 9];
+			dir[1] = offsets[(cand / 3) % 3];
+			dir[2] = offsets[cand % 3];
+			if(GetVectorDotProduct(lastPlane, dir) <= 0.0)
+				continue;
+			nratios = 1;
+		}
+
+		for(int r = 0; r < nratios; r++)
+		{
+			float depth = RAMP_PIERCE_DISTANCE * ((cand == 0 && nratios == 2 && r == 0) ? 0.5 : 1.0);
+			VectorMA(start, depth, dir, offStart);
+			VectorMA(end, depth, dir, offEnd);
+			vs.FromArray(offStart);
+			ve.FromArray(offEnd);
+			TracePlayerBBox(pThis, vs, ve, MASK_PLAYERSOLID, COLLISION_GROUP_PLAYER_MOVEMENT, pierce);
+			if(!IsValidMovementTrace(pThis, pierce))
+				continue;
+
+			float pierceN[3];
+			pierce.plane.normal.ToArray(pierceN);
+			bool valid_plane = pierce.fraction < 1.0 && pierce.fraction > 0.1
+				&& GetVectorDotProduct(pierceN, lastPlane) >= RAMP_BUG_THRESHOLD;
+			bool hit_new = GetVectorDotProduct(errN, pierceN) < NEW_RAMP_THRESHOLD
+				&& GetVectorDotProduct(lastPlane, pierceN) > NEW_RAMP_THRESHOLD;
+			bool good = CloseEnoughFloat(pierce.fraction, 1.0) || valid_plane;
+			if(!good && !hit_new)
+				continue;
+
+			// land back on the intended line before adopting
+			pierce.endpos.ToArray(buff);
+			vs.FromArray(buff);
+			ve.FromArray(end);
+			TracePlayerBBox(pThis, vs, ve, MASK_PLAYERSOLID, COLLISION_GROUP_PLAYER_MOVEMENT, confirm);
+			if(!IsValidMovementTrace(pThis, confirm))
+				continue;
+
+			pierce.CopyTo(pm);
+			pm.startpos.FromArray(start);
+			confirm.endpos.ToArray(buff);
+			pm.endpos.FromArray(buff);
+			pierce.endpos.ToArray(buff);
+			float frac = total > 0.0 ? GetVectorDistance(offStart, buff) / total : 1.0;
+			pm.fraction = frac < 1.0 ? frac : 1.0;
+			if(pm.plane.normal.Length() <= FLT_EPSILON)
+				confirm.plane.normal.ToArray(buff), pm.plane.normal.FromArray(buff);
+			return true;
+		}
+	}
+	return false;
+}
+
+// Expanding-shell search for the nearest origin where the player hull fits.
+// Zero-length hull tests only (<= 12 shells x 7 dirs = 84 traces), and only
+// runs when the player is already embedded in solid - the case where every
+// other path has failed and the player would otherwise stay frozen forever.
+// The 32u radius cap is deliberate: big enough for any wedge, too small to
+// cross a wall. ponytail: fixed shell table, no BSP-aware push-out.
+bool TryEmbeddedRescue(CGameMovement pThis, float org[3], Vector vecVelocity)
+{
+	// dense up to hull height - wedge pockets are often barely hull-sized
+	static const float shells[] = {1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0};
+	float dirs[7][3];
+	int ndirs = 0;
+
+	// back out the way we came in first
+	float v[3];
+	vecVelocity.ToArray(v);
+	if(GetVectorLength(v, true) > 1.0)
+	{
+		NormalizeVector(v, v);
+		ScaleVector(v, -1.0);
+		VectorCopy(v, dirs[ndirs++]);
+	}
+	dirs[ndirs][2] = 1.0; ndirs++;
+	dirs[ndirs][2] = -1.0; ndirs++;
+	dirs[ndirs][0] = 1.0; ndirs++;
+	dirs[ndirs][0] = -1.0; ndirs++;
+	dirs[ndirs][1] = 1.0; ndirs++;
+	dirs[ndirs][1] = -1.0; ndirs++;
+
+	static Vector cand;
+	if(cand.Address == Address_Null)
+		cand = Vector();
+
+	static CGameTrace tr;
+	if(tr.Address == Address_Null)
+		tr = CGameTrace();
+
+	float pos[3];
+	bool found = false;
+
+	for(int s = 0; s < sizeof(shells) && !found; s++)
+	{
+		for(int d = 0; d < ndirs && !found; d++)
+		{
+			VectorMA(org, shells[s], dirs[d], pos);
+			cand.FromArray(pos);
+			TracePlayerBBox(pThis, cand, cand, MASK_PLAYERSOLID, COLLISION_GROUP_PLAYER_MOVEMENT, tr);
+			if(!tr.startsolid && CloseEnoughFloat(tr.fraction, 1.0))
+			{
+				VectorCopy(pos, org);
+				found = true;
+			}
+		}
+	}
+
+	return found;
+}
+
 stock bool IsValidMovementTrace(CGameMovement pThis, CGameTrace tr)
 {
 	if(tr.allsolid || tr.startsolid)
@@ -689,4 +900,4 @@ stock void UTIL_TraceRay(Ray_t ray, int mask, CGameMovement gm, int collisionGro
 		
 		filter.Free();
 	}
-}
+}
